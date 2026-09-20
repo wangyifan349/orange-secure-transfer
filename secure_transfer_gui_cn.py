@@ -8,6 +8,7 @@ import hashlib
 import os
 import pathlib
 import queue
+import shutil
 import socket
 import struct
 import sys
@@ -15,10 +16,11 @@ import threading
 import time
 import uuid
 import math
+from datetime import datetime
 from typing import BinaryIO, Dict, Optional, Tuple
 
-from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QCloseEvent, QKeyEvent, QPalette, QColor
+from PyQt6.QtCore import QObject, Qt, QTimer, QUrl, pyqtSignal
+from PyQt6.QtGui import QCloseEvent, QDesktopServices, QKeyEvent, QPalette, QColor
 from PyQt6.QtWidgets import (
     QApplication,
     QDialog,
@@ -28,6 +30,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QPushButton,
     QProgressBar,
     QScrollArea,
@@ -115,7 +118,10 @@ def perform_handshake(sock: socket.socket, is_server: bool) -> bytes:
         send_frame(sock, public_bytes)
         peer_public_bytes = recv_frame(sock)
     peer_key = X25519PublicKey.from_public_bytes(peer_public_bytes)
-    return derive_key(private_key.exchange(peer_key))
+    session_key = derive_key(private_key.exchange(peer_key))
+    key_fingerprint = hashlib.sha256(session_key).hexdigest()
+    print(f"[*] 握手成功，会话密钥 SHA-256 指纹：{key_fingerprint}", flush=True)
+    return session_key
 
 
 APP_NAME = "橘信传输"
@@ -456,6 +462,7 @@ class TransferEngine(QObject):
             "state": "complete" if verified else "failed",
             "progress": 100,
             "hash": actual.hex(),
+            "path": str(target) if verified else "",
             "detail": (
                 f"{ui_text('SHA-256 校验成功')} · {ui_text('已保存到')} {target}"
                 if verified else
@@ -736,10 +743,13 @@ class TextBubble(ClickableBubble):
 
 
 class FileBubble(ClickableBubble):
+    save_as_requested = pyqtSignal(str)
+
     def __init__(self, name: str, own: bool, size: Optional[int] = None) -> None:
         super().__init__(own)
         self.name = name
         self.size = size
+        self.received_path = ""
         self.terminal = False
         layout = QVBoxLayout(self)
         layout.setContentsMargins(11, 9, 11, 9)
@@ -777,12 +787,16 @@ class FileBubble(ClickableBubble):
             self.size_label.setText(human_size(self.size))
         if "progress" in event:
             self.progress.setValue(int(event["progress"]))
+        if event.get("path"):
+            self.received_path = str(event["path"])
         if state == "complete":
             self.terminal = True
             self.setProperty("transferState", "complete")
         elif state == "failed":
             self.terminal = True
             self.setProperty("transferState", "failed")
+        elif state in ("hashing", "sending", "verifying", "receiving"):
+            self.setProperty("transferState", "active")
         self.style().unpolish(self)
         self.style().polish(self)
         self._refresh_copy_text()
@@ -794,9 +808,24 @@ class FileBubble(ClickableBubble):
             lines.append(f"{size_label}: {human_size(self.size)} ({self.size} bytes)")
         self.copy_text = "\n".join(lines)
 
+    def contextMenuEvent(self, event) -> None:
+        menu = QMenu(self)
+        open_location_action = menu.addAction("打开文件所在位置")
+        save_action = menu.addAction("另存为")
+        can_access_file = bool(self.received_path)
+        open_location_action.setEnabled(can_access_file)
+        save_action.setEnabled(can_access_file)
+        selected_action = menu.exec(event.globalPos())
+        if selected_action == open_location_action:
+            directory = pathlib.Path(self.received_path).parent
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory)))
+        elif selected_action == save_action:
+            self.save_as_requested.emit(self.received_path)
+
 
 class DropChatArea(QScrollArea):
     files_dropped = pyqtSignal(list)
+    export_requested = pyqtSignal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -819,6 +848,12 @@ class DropChatArea(QScrollArea):
             self.files_dropped.emit(paths)
             event.acceptProposedAction()
 
+    def contextMenuEvent(self, event) -> None:
+        menu = QMenu(self)
+        export_action = menu.addAction("导出聊天记录")
+        if menu.exec(event.globalPos()) == export_action:
+            self.export_requested.emit()
+
 
 #---------- Main chat window ----------
 class MainWindow(QMainWindow):
@@ -829,6 +864,7 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(700, 540)
         self.engine = TransferEngine()
         self.file_bubbles: Dict[str, FileBubble] = {}
+        self.chat_history = []
         self.is_connected = False
         self._build_ui()
         self._connect_engine()
@@ -847,6 +883,7 @@ class MainWindow(QMainWindow):
         self.chat.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.chat.setFrameShape(QFrame.Shape.NoFrame)
         self.chat.files_dropped.connect(self._queue_files)
+        self.chat.export_requested.connect(self._export_history)
         chat_content = QWidget()
         chat_content.setObjectName("chatContent")
         self.messages = QVBoxLayout(chat_content)
@@ -885,14 +922,8 @@ class MainWindow(QMainWindow):
     #---------- Engine signals ----------
     def _connect_engine(self) -> None:
         self.engine.connected.connect(self._on_connected)
-        self.engine.status_changed.connect(self._add_system_message)
         self.engine.disconnected.connect(self._on_disconnected)
         self.engine.message_received.connect(lambda text: self._add_text(text, False))
-        self.engine.message_failed.connect(
-            lambda reason: self._add_system_message(
-                f"{ui_text('消息发送失败')}：{reason}"
-            )
-        )
         self.engine.file_changed.connect(self._on_file_changed)
 
     def _on_connected(self, peer: str) -> None:
@@ -903,7 +934,6 @@ class MainWindow(QMainWindow):
     def _on_disconnected(self, reason: str) -> None:
         self.is_connected = False
         self._set_controls_enabled(False)
-        self._add_system_message(reason)
 
     def _set_controls_enabled(self, enabled: bool) -> None:
         self.composer.setEnabled(enabled)
@@ -924,13 +954,13 @@ class MainWindow(QMainWindow):
 
     def _queue_files(self, paths: list) -> None:
         if not self.is_connected:
-            self._add_system_message(ui_text("尚未连接，无法发送文件"))
             return
         for path in paths:
             name = pathlib.Path(path).name or path
             bubble = FileBubble(name, True)
             ui_id = self.engine.queue_file(path)
             self.file_bubbles[ui_id] = bubble
+            bubble.save_as_requested.connect(self._save_file_as)
             self._add_bubble(bubble, True)
 
     def _on_file_changed(self, event: Dict[str, object]) -> None:
@@ -943,12 +973,46 @@ class MainWindow(QMainWindow):
                 int(event["size"]) if "size" in event else None,
             )
             self.file_bubbles[ui_id] = bubble
+            bubble.save_as_requested.connect(self._save_file_as)
             self._add_bubble(bubble, event.get("direction") == "out")
         bubble.update_info(event)
+        if event.get("state") == "complete":
+            direction = "发送文件" if event.get("direction") == "out" else "接收文件"
+            self.chat_history.append(
+                f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {direction}: {bubble.name}"
+            )
         self._scroll_to_bottom()
 
     def _add_text(self, text: str, own: bool) -> None:
+        sender = "我" if own else "对方"
+        self.chat_history.append(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {sender}: {text}")
         self._add_bubble(TextBubble(text, own), own)
+
+    def _export_history(self) -> None:
+        default_name = f"chat-{datetime.now():%Y%m%d-%H%M%S}.txt"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出聊天记录", default_name, "Text files (*.txt)"
+        )
+        if not path:
+            return
+        content = "\n\n".join(self.chat_history)
+        threading.Thread(
+            target=pathlib.Path(path).write_text,
+            args=(content,),
+            kwargs={"encoding": "utf-8"},
+            daemon=True,
+        ).start()
+
+    def _save_file_as(self, source_path: str) -> None:
+        source = pathlib.Path(source_path)
+        destination, _ = QFileDialog.getSaveFileName(self, "另存为", source.name)
+        if not destination:
+            return
+        threading.Thread(
+            target=shutil.copy2,
+            args=(source_path, destination),
+            daemon=True,
+        ).start()
 
     def _add_bubble(self, bubble: QWidget, own: bool) -> None:
         row = QWidget()
@@ -961,14 +1025,6 @@ class MainWindow(QMainWindow):
             row_layout.addWidget(bubble)
             row_layout.addStretch()
         self.messages.insertWidget(self.messages.count() - 1, row)
-        self._scroll_to_bottom()
-
-    def _add_system_message(self, text: str) -> None:
-        label = QLabel(text)
-        label.setObjectName("systemMessage")
-        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        label.setWordWrap(True)
-        self.messages.insertWidget(self.messages.count() - 1, label)
         self._scroll_to_bottom()
 
     def _scroll_to_bottom(self) -> None:
@@ -1042,6 +1098,10 @@ QFrame#ownBubble { background: #f05a00; border-color: #f05a00; }
 QFrame#peerBubble { background: #fffd00; }
 QFrame#ownBubble QLabel { color: #ffff00; background: transparent; }
 QFrame#peerBubble QLabel { color: #2b2100; background: transparent; }
+QFrame[transferState="active"] { background: #24a000; border: 2px solid #178000; }
+QFrame[transferState="active"] QLabel { color: #ffff00; background: transparent; }
+QFrame[transferState="complete"] { background: #d83200; border: 2px solid #a82000; }
+QFrame[transferState="complete"] QLabel { color: #ffff00; background: transparent; }
 QLabel#bubbleText { font-size: 14px; }
 QLabel#fileIcon {
     font-size: 10px;
@@ -1055,7 +1115,6 @@ QLabel#fileSize { font-size: 11px; }
 QFrame#ownBubble QLabel#fileSize { color: #fff100; }
 QFrame#peerBubble QLabel#fileSize { color: #806b00; }
 QFrame[transferState="failed"] { border: 2px solid #a82400; }
-QFrame[transferState="complete"] { border: 2px solid #c84600; }
 QProgressBar { border: none; background: #eade00; border-radius: 2px; }
 QProgressBar::chunk { background: #8d2600; border-radius: 2px; }
 QFrame#peerBubble QProgressBar::chunk { background: #e84d00; }
