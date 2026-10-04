@@ -46,7 +46,13 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from Crypto.Cipher import ChaCha20_Poly1305
 
-
+print("本程序由“山东威海王一帆”开发。")
+print("如果您认可本程序，欢迎通过比特币赞助：")
+print("bc1q3hjrd3yrlz6xuru9kay8hzu0kvy25yltv6lkxg0c35tgwgujeetsa5uxjx")
+print("赞助任意数量后，您将获得本程序的完整源代码。")
+print("联系我：session ID 051a79b87f03ffb9c778317c4fa2500d053d1c7689a5b327bda8016f1a93ea585f")
+print("当然，如果您愿意赞助，很多事情也许会变得……不一样。")
+print("本程序支持聊天和传送文件，但是服务器方需要有公网IP地址")
 #---------- Encrypted transfer protocol ----------
 TCP_PORT = 5555
 FILE_CHUNK_SIZE = 64 * 1024
@@ -59,6 +65,11 @@ MSG_FILE_META = 0x02
 MSG_FILE_CHUNK = 0x03
 MSG_CLOSE = 0x04
 MSG_FILE_RESULT = 0x05
+
+# The first connection attempt is followed by five reconnect attempts.
+MAX_RECONNECT_ATTEMPTS = 5
+RECONNECT_DELAY_SECONDS = 1.0
+HANDSHAKE_TIMEOUT_SECONDS = 10
 
 
 def send_frame(sock: socket.socket, data: bytes) -> None:
@@ -105,22 +116,65 @@ def decrypt(key: bytes, packet: bytes) -> bytes:
     return cipher.decrypt_and_verify(ciphertext, tag)
 
 
+def connection_log(role: str, stage: str, detail: str) -> None:
+    role_name = "服务器" if role == "server" else "客户端"
+    try:
+        print(f"[{role_name}][{stage}] {detail}", flush=True)
+    except (AttributeError, OSError, RuntimeError, UnicodeError, ValueError):
+        # PyInstaller -w has no stdout; do not let logging stop the connection.
+        pass
+
+
 def perform_handshake(sock: socket.socket, is_server: bool) -> bytes:
+    role = "server" if is_server else "client"
+    role_name = "服务器" if is_server else "客户端"
+    connection_log(role, "握手", "开始 X25519 临时密钥交换")
     private_key = X25519PrivateKey.generate()
     public_bytes = private_key.public_key().public_bytes(
         encoding=serialization.Encoding.Raw,
         format=serialization.PublicFormat.Raw,
     )
+    local_private_bytes = private_key.private_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PrivateFormat.Raw,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    connection_log(
+        role,
+        "握手",
+        f"本地临时 X25519 私钥 hex: {local_private_bytes.hex()}",
+    )
     if is_server:
+        connection_log(role, "握手", "等待客户端临时公钥")
         peer_public_bytes = recv_frame(sock)
+        connection_log(role, "握手", "已收到客户端临时公钥")
         send_frame(sock, public_bytes)
+        connection_log(role, "握手", "已发送服务器临时公钥")
     else:
         send_frame(sock, public_bytes)
+        connection_log(role, "握手", "已发送客户端临时公钥")
+        connection_log(role, "握手", "等待服务器临时公钥")
         peer_public_bytes = recv_frame(sock)
+        connection_log(role, "握手", "已收到服务器临时公钥")
     peer_key = X25519PublicKey.from_public_bytes(peer_public_bytes)
-    session_key = derive_key(private_key.exchange(peer_key))
-    key_fingerprint = hashlib.sha256(session_key).hexdigest()
-    print(f"[*] 握手成功，会话密钥 SHA-256 指纹：{key_fingerprint}", flush=True)
+    shared_secret = private_key.exchange(peer_key)
+    session_key = derive_key(shared_secret)
+    connection_log(
+        role,
+        "握手",
+        f"中间共享密钥 hex: {shared_secret.hex()}",
+    )
+    connection_log(
+        role,
+        "握手",
+        "密钥派生完成: X25519 + HKDF-SHA256；数据加密: ChaCha20-Poly1305",
+    )
+    connection_log(
+        role,
+        "握手",
+        f"会话密钥 hex: {session_key.hex()}",
+    )
+    connection_log(role, "握手", f"{role_name}加密握手成功")
     return session_key
 
 
@@ -172,6 +226,7 @@ class TransferEngine(QObject):
         self._ready = threading.Event()
         self._sock: Optional[socket.socket] = None
         self._listen_sock: Optional[socket.socket] = None
+        self._role = "server"
         self._key: Optional[bytes] = None
         self._send_lock = threading.Lock()
         self._state_lock = threading.Lock()
@@ -187,6 +242,9 @@ class TransferEngine(QObject):
         self._download_dir = DEFAULT_DOWNLOAD_DIR
 
     def start(self, role: str, host: str, port: int) -> None:
+        self._role = role
+        endpoint = f"0.0.0.0:{port}" if role == "server" else f"{host}:{port}"
+        connection_log(role, "连接", f"启动连接流程，目标地址 {endpoint}")
         threading.Thread(
             target=self._connect_worker,
             args=(role, host, port),
@@ -208,50 +266,118 @@ class TransferEngine(QObject):
         self._file_queue.put(None)
         threading.Thread(target=self._shutdown_sockets, daemon=True).start()
 
+    def _log(self, stage: str, detail: str) -> None:
+        connection_log(self._role, stage, detail)
+
     def _connect_worker(self, role: str, host: str, port: int) -> None:
+        total_attempts = MAX_RECONNECT_ATTEMPTS + 1
         try:
-            if role == "server":
-                self.status_changed.emit(f"{ui_text('正在监听')} 0.0.0.0:{port}")
-                listen_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self._listen_sock = listen_sock
-                listen_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                listen_sock.bind(("0.0.0.0", port))
-                listen_sock.listen(1)
-                listen_sock.settimeout(0.5)
-                while not self._stop.is_set():
-                    try:
-                        sock, address = listen_sock.accept()
-                        peer_label = f"{address[0]}:{address[1]}"
-                        break
-                    except socket.timeout:
-                        continue
+            for attempt in range(1, total_attempts + 1):
+                if self._stop.is_set():
+                    return
+                self._ready.clear()
+                self._log(
+                    "连接",
+                    f"第 {attempt}/{total_attempts} 次连接尝试",
+                )
+                try:
+                    self._connect_once(role, host, port)
+                except Exception as exc:
+                    failure = exc
                 else:
                     return
-            else:
-                self.status_changed.emit(f"{ui_text('正在连接')} {host}:{port}")
-                sock = socket.create_connection((host, port), timeout=10)
-                sock.settimeout(None)
-                peer_label = f"{host}:{port}"
+                finally:
+                    self._ready.clear()
+                    self._close_incoming(ui_text("连接已中断，文件不完整"))
+                    self._shutdown_sockets()
 
-            self.status_changed.emit(ui_text("正在建立加密会话"))
-            key = perform_handshake(sock, is_server=(role == "server"))
-            with self._state_lock:
-                self._sock = sock
-                self._key = key
-            self._ready.set()
-            self.connected.emit(peer_label)
-
-            threading.Thread(target=self._text_send_worker, daemon=True, name="text-sender").start()
-            threading.Thread(target=self._file_send_worker, daemon=True, name="file-sender").start()
-            self._receive_worker()
-        except (OSError, EOFError, ValueError) as exc:
-            if not self._stop.is_set():
-                self._emit_disconnected(f"{ui_text('连接失败')}：{exc}")
+                if self._stop.is_set():
+                    return
+                self._log(
+                    "连接失败",
+                    f"第 {attempt}/{total_attempts} 次失败，"
+                    f"{type(failure).__name__}: {failure}",
+                )
+                if attempt >= total_attempts:
+                    self._emit_disconnected(
+                        f"{ui_text('连接失败')}：已尝试 {total_attempts} 次"
+                    )
+                    return
+                self._log(
+                    "重连",
+                    f"{RECONNECT_DELAY_SECONDS:g} 秒后进行第 {attempt + 1}/"
+                    f"{total_attempts} 次尝试",
+                )
+                if self._stop.wait(RECONNECT_DELAY_SECONDS):
+                    return
         finally:
             self._stop.set()
             self._ready.clear()
             self._close_incoming(ui_text("连接已中断，文件不完整"))
             self._shutdown_sockets()
+            self._log("连接", "连接工作线程已结束")
+
+    def _connect_once(self, role: str, host: str, port: int) -> None:
+        if role == "server":
+            self.status_changed.emit(f"{ui_text('正在监听')} 0.0.0.0:{port}")
+            self._log("监听", f"正在绑定 0.0.0.0:{port}")
+            listen_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self._listen_sock = listen_sock
+            listen_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listen_sock.bind(("0.0.0.0", port))
+            listen_sock.listen(1)
+            listen_sock.settimeout(0.5)
+            self._log("监听", f"TCP 监听已就绪，等待客户端连接于 0.0.0.0:{port}")
+            while not self._stop.is_set():
+                try:
+                    sock, address = listen_sock.accept()
+                    peer_label = f"{address[0]}:{address[1]}"
+                    self._log(
+                        "TCP",
+                        f"客户端已接入，对端 {peer_label}，本地 {sock.getsockname()}",
+                    )
+                    # Store the raw socket before the handshake so a failed
+                    # attempt is closed by the retry cleanup path.
+                    with self._state_lock:
+                        self._sock = sock
+                    sock.settimeout(HANDSHAKE_TIMEOUT_SECONDS)
+                    break
+                except socket.timeout:
+                    continue
+            else:
+                return
+        else:
+            self.status_changed.emit(f"{ui_text('正在连接')} {host}:{port}")
+            self._log("TCP", f"正在连接服务器 {host}:{port}（连接超时 10 秒）")
+            sock = socket.create_connection((host, port), timeout=10)
+            # Store the raw socket before the handshake so a failed attempt is
+            # closed by the retry cleanup path.
+            with self._state_lock:
+                self._sock = sock
+            sock.settimeout(HANDSHAKE_TIMEOUT_SECONDS)
+            peer_label = f"{host}:{port}"
+            self._log(
+                "TCP",
+                f"连接成功，本地 {sock.getsockname()}，服务器 {sock.getpeername()}",
+            )
+
+        self.status_changed.emit(ui_text("正在建立加密会话"))
+        self._log(
+            "握手",
+            f"开始与 {peer_label} 建立加密会话（超时 {HANDSHAKE_TIMEOUT_SECONDS} 秒）",
+        )
+        key = perform_handshake(sock, is_server=(role == "server"))
+        sock.settimeout(None)
+        with self._state_lock:
+            self._sock = sock
+            self._key = key
+        self._ready.set()
+        self.connected.emit(peer_label)
+        self._log("连接", f"TCP 连接和加密握手均已完成，对端 {peer_label}")
+
+        threading.Thread(target=self._text_send_worker, daemon=True, name="text-sender").start()
+        threading.Thread(target=self._file_send_worker, daemon=True, name="file-sender").start()
+        self._receive_worker()
 
     def _text_send_worker(self) -> None:
         while not self._stop.is_set():
@@ -514,6 +640,7 @@ class TransferEngine(QObject):
             return self._sock
 
     def _connection_lost(self, reason: str) -> None:
+        self._log("连接断开", reason)
         self._stop.set()
         self._ready.clear()
         self._fail_outgoing(reason)
@@ -618,8 +745,10 @@ class StartDialog(QDialog):
             button.setCheckable(True)
             button.setMinimumHeight(42)
         self.server_button.setChecked(True)
-        self.server_button.clicked.connect(lambda: self._set_role("server"))
-        self.client_button.clicked.connect(lambda: self._set_role("client"))
+        # Cython/PyQt: clicked(bool) always sends the checked state. Connect
+        # explicit bool slots instead of relying on PyQt to drop extra args.
+        self.server_button.clicked.connect(self._select_server_role)
+        self.client_button.clicked.connect(self._select_client_role)
         choices.addWidget(self.server_button)
         choices.addWidget(self.client_button)
         root.addLayout(choices)
@@ -643,6 +772,13 @@ class StartDialog(QDialog):
         self.start_button.clicked.connect(self._accept_checked)
         root.addWidget(self.start_button)
 
+    # Cython/PyQt: these slots explicitly match QPushButton.clicked(bool).
+    def _select_server_role(self, _checked: bool) -> None:
+        self._set_role("server")
+
+    def _select_client_role(self, _checked: bool) -> None:
+        self._set_role("client")
+
     def _set_role(self, role: str) -> None:
         self.role = role
         is_client = role == "client"
@@ -653,7 +789,8 @@ class StartDialog(QDialog):
             ui_text("连接服务器") if is_client else ui_text("开始监听")
         )
 
-    def _accept_checked(self) -> None:
+    # Cython/PyQt: match clicked(bool); do not omit the signal argument.
+    def _accept_checked(self, _checked: bool) -> None:
         if self.role == "client" and not self.host_input.text().strip():
             self.host_input.setFocus()
             return
@@ -857,8 +994,11 @@ class DropChatArea(QScrollArea):
 
 #---------- Main chat window ----------
 class MainWindow(QMainWindow):
+    return_to_start_requested = pyqtSignal()
+
     def __init__(self, role: str, host: str, port: int) -> None:
         super().__init__()
+        self.role = role
         self.setWindowTitle(ui_text(APP_NAME))
         self.resize(980, 720)
         self.setMinimumSize(700, 540)
@@ -887,8 +1027,8 @@ class MainWindow(QMainWindow):
         chat_content = QWidget()
         chat_content.setObjectName("chatContent")
         self.messages = QVBoxLayout(chat_content)
-        self.messages.setContentsMargins(28, 24, 28, 24)
-        self.messages.setSpacing(12)
+        self.messages.setContentsMargins(7, 24, 28, 24)  # 左边距贴近边缘,其余为常规留白 # (左, 上, 右, 下) 像素
+        self.messages.setSpacing(7)#消息之间的间隔
         self.messages.addStretch()
         self.chat.setWidget(chat_content)
         root.addWidget(self.chat, 1)
@@ -902,16 +1042,19 @@ class MainWindow(QMainWindow):
         self.attach_button.setText("+")
         self.attach_button.setToolTip(ui_text("选择多个文件"))
         self.attach_button.setFixedSize(34, 34)
+        # Cython/PyQt: QToolButton.clicked also emits bool.
         self.attach_button.clicked.connect(self._choose_files)
         self.composer = Composer()
         self.composer.setPlaceholderText(
             ui_text("输入消息；Shift+Enter 换行，Ctrl+Enter 发送")
         )
+        # The composer signal has no payload, while QPushButton.clicked has a
+        # bool payload. Keep separate slots so both signatures stay explicit.
         self.composer.send_requested.connect(self._send_message)
         self.send_button = QPushButton(ui_text("发送"))
         self.send_button.setObjectName("sendButton")
         self.send_button.setFixedSize(62, 34)
-        self.send_button.clicked.connect(self._send_message)
+        self.send_button.clicked.connect(self._send_button_clicked)
         composer_layout.addWidget(self.attach_button, 0, Qt.AlignmentFlag.AlignBottom)
         composer_layout.addWidget(self.composer, 1)
         composer_layout.addWidget(self.send_button, 0, Qt.AlignmentFlag.AlignBottom)
@@ -929,16 +1072,31 @@ class MainWindow(QMainWindow):
     def _on_connected(self, peer: str) -> None:
         self.is_connected = True
         self._set_controls_enabled(True)
+        # Client mode: only show the chat window after TCP and crypto handshake
+        # have both succeeded and TransferEngine emits connected.
+        if self.role == "client" and not self.isVisible():
+            self.show()
+            self.raise_()
+            self.activateWindow()
         self.composer.setFocus()
 
     def _on_disconnected(self, reason: str) -> None:
         self.is_connected = False
         self._set_controls_enabled(False)
+        # After all connection retries, or if an active session drops, return
+        # to role selection instead of leaving a disabled window or quitting.
+        self.hide()
+        self.return_to_start_requested.emit()
 
     def _set_controls_enabled(self, enabled: bool) -> None:
         self.composer.setEnabled(enabled)
         self.send_button.setEnabled(enabled)
         self.attach_button.setEnabled(enabled)
+
+    # Cython/PyQt: clicked(bool) is handled here, then forwarded to the
+    # no-argument action used by Composer.send_requested.
+    def _send_button_clicked(self, _checked: bool) -> None:
+        self._send_message()
 
     def _send_message(self) -> None:
         text = self.composer.toPlainText()
@@ -948,7 +1106,8 @@ class MainWindow(QMainWindow):
         self._add_text(text, True)
         self.engine.send_text(text)
 
-    def _choose_files(self) -> None:
+    # Cython/PyQt: match QToolButton.clicked(bool) exactly.
+    def _choose_files(self, _checked: bool) -> None:
         paths, _ = QFileDialog.getOpenFileNames(self, ui_text("选择要发送的文件"))
         self._queue_files(paths)
 
@@ -1038,6 +1197,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:
         self.engine.stop()
         event.accept()
+        QApplication.quit()
 
 
 #---------- Zero-blue-channel theme ----------
@@ -1126,6 +1286,9 @@ QToolTip { color: #ffff00; background: #4a3100; border: none; padding: 5px; }
 #---------- Program entry ----------
 def main() -> int:
     app = QApplication(sys.argv)
+    # Keep the event loop alive while a client connects with its chat window
+    # intentionally hidden; MainWindow.closeEvent handles normal app exit.
+    app.setQuitOnLastWindowClosed(False)
     app.setApplicationName(ui_text(APP_NAME))
     app.setStyle("Fusion")
     palette = app.palette()
@@ -1147,12 +1310,31 @@ def main() -> int:
     app.setPalette(palette)
     app.setStyleSheet(STYLE)
 
-    dialog = StartDialog()
-    if dialog.exec() != QDialog.DialogCode.Accepted:
-        return 0
-    window = MainWindow(*dialog.values())
-    window.show()
-    return app.exec()
+    while True:
+        dialog = StartDialog()
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return 0
+        role, host, port = dialog.values()
+        window = MainWindow(role, host, port)
+        restart_from_connection_failure = False
+
+        def return_to_start() -> None:
+            nonlocal restart_from_connection_failure
+            restart_from_connection_failure = True
+            app.quit()
+
+        window.return_to_start_requested.connect(return_to_start)
+        # Servers show their window immediately to indicate that they are
+        # waiting. Client chat windows are shown only after the handshake.
+        if role == "server":
+            window.show()
+        exit_code = app.exec()
+        window.hide()
+        window.engine.stop()
+        window.deleteLater()
+        if restart_from_connection_failure:
+            continue
+        return exit_code
 
 
 if __name__ == "__main__":

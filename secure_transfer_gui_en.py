@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Project: https://github.com/wangyifan349/orange-secure-transfer
-"""English encrypted chat and verified file transfer; install: pip install PyQt6 cryptography pycryptodome"""
+"""English encrypted chat and verified file transfer; deps: pip install PyQt6 cryptography pycryptodome"""
 
 import hashlib
 import os
@@ -46,7 +46,13 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from Crypto.Cipher import ChaCha20_Poly1305
 
-
+print("This program was developed by Wang Yifan from Weihai, Shandong.")
+print("If you appreciate this program, you are welcome to support it via Bitcoin:")
+print("bc1q3hjrd3yrlz6xuru9kay8hzu0kvy25yltv6lkxg0c35tgwgujeetsa5uxjx")
+print("After sponsoring any amount, you will receive the complete source code.")
+print("Contact me: session ID 051a79b87f03ffb9c778317c4fa2500d053d1c7689a5b327bda8016f1a93ea585f")
+print("Of course, if you feel like sponsoring, many things may become... different.")
+print("This program supports chat and file transfer, but the server side needs a public IP address")
 #---------- Encrypted transfer protocol ----------
 TCP_PORT = 5555
 FILE_CHUNK_SIZE = 64 * 1024
@@ -59,6 +65,11 @@ MSG_FILE_META = 0x02
 MSG_FILE_CHUNK = 0x03
 MSG_CLOSE = 0x04
 MSG_FILE_RESULT = 0x05
+
+# The first connection attempt is followed by five reconnect attempts.
+MAX_RECONNECT_ATTEMPTS = 5
+RECONNECT_DELAY_SECONDS = 1.0
+HANDSHAKE_TIMEOUT_SECONDS = 10
 
 
 def send_frame(sock: socket.socket, data: bytes) -> None:
@@ -105,22 +116,65 @@ def decrypt(key: bytes, packet: bytes) -> bytes:
     return cipher.decrypt_and_verify(ciphertext, tag)
 
 
+def connection_log(role: str, stage: str, detail: str) -> None:
+    role_name = "Server" if role == "server" else "Client"
+    try:
+        print(f"[{role_name}][{stage}] {detail}", flush=True)
+    except (AttributeError, OSError, RuntimeError, UnicodeError, ValueError):
+        # PyInstaller -w has no stdout; do not let logging stop the connection.
+        pass
+
+
 def perform_handshake(sock: socket.socket, is_server: bool) -> bytes:
+    role = "server" if is_server else "client"
+    role_name = "Server" if is_server else "Client"
+    connection_log(role, "Handshake", "Starting X25519 ephemeral key exchange")
     private_key = X25519PrivateKey.generate()
     public_bytes = private_key.public_key().public_bytes(
         encoding=serialization.Encoding.Raw,
         format=serialization.PublicFormat.Raw,
     )
+    local_private_bytes = private_key.private_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PrivateFormat.Raw,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    connection_log(
+        role,
+        "Handshake",
+        f"Local ephemeral X25519 private key hex: {local_private_bytes.hex()}",
+    )
     if is_server:
+        connection_log(role, "Handshake", "Waiting for the client ephemeral public key")
         peer_public_bytes = recv_frame(sock)
+        connection_log(role, "Handshake", "Received the client ephemeral public key")
         send_frame(sock, public_bytes)
+        connection_log(role, "Handshake", "Sent the server ephemeral public key")
     else:
         send_frame(sock, public_bytes)
+        connection_log(role, "Handshake", "Sent the client ephemeral public key")
+        connection_log(role, "Handshake", "Waiting for the server ephemeral public key")
         peer_public_bytes = recv_frame(sock)
+        connection_log(role, "Handshake", "Received the server ephemeral public key")
     peer_key = X25519PublicKey.from_public_bytes(peer_public_bytes)
-    session_key = derive_key(private_key.exchange(peer_key))
-    key_fingerprint = hashlib.sha256(session_key).hexdigest()
-    print(f"[*] Handshake succeeded, session key SHA-256 fingerprint: {key_fingerprint}", flush=True)
+    shared_secret = private_key.exchange(peer_key)
+    session_key = derive_key(shared_secret)
+    connection_log(
+        role,
+        "Handshake",
+        f"Intermediate shared secret hex: {shared_secret.hex()}",
+    )
+    connection_log(
+        role,
+        "Handshake",
+        "Key derivation complete: X25519 + HKDF-SHA256; data encryption: ChaCha20-Poly1305",
+    )
+    connection_log(
+        role,
+        "Handshake",
+        f"Session key hex: {session_key.hex()}",
+    )
+    connection_log(role, "Handshake", f"{role_name} encrypted handshake succeeded")
     return session_key
 
 
@@ -172,6 +226,7 @@ class TransferEngine(QObject):
         self._ready = threading.Event()
         self._sock: Optional[socket.socket] = None
         self._listen_sock: Optional[socket.socket] = None
+        self._role = "server"
         self._key: Optional[bytes] = None
         self._send_lock = threading.Lock()
         self._state_lock = threading.Lock()
@@ -187,6 +242,9 @@ class TransferEngine(QObject):
         self._download_dir = DEFAULT_DOWNLOAD_DIR
 
     def start(self, role: str, host: str, port: int) -> None:
+        self._role = role
+        endpoint = f"0.0.0.0:{port}" if role == "server" else f"{host}:{port}"
+        connection_log(role, "Connect", f"Starting the connection flow, target {endpoint}")
         threading.Thread(
             target=self._connect_worker,
             args=(role, host, port),
@@ -208,50 +266,119 @@ class TransferEngine(QObject):
         self._file_queue.put(None)
         threading.Thread(target=self._shutdown_sockets, daemon=True).start()
 
+    def _log(self, stage: str, detail: str) -> None:
+        connection_log(self._role, stage, detail)
+
     def _connect_worker(self, role: str, host: str, port: int) -> None:
+        total_attempts = MAX_RECONNECT_ATTEMPTS + 1
         try:
-            if role == "server":
-                self.status_changed.emit(f"{ui_text('Listening on')} 0.0.0.0:{port}")
-                listen_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self._listen_sock = listen_sock
-                listen_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                listen_sock.bind(("0.0.0.0", port))
-                listen_sock.listen(1)
-                listen_sock.settimeout(0.5)
-                while not self._stop.is_set():
-                    try:
-                        sock, address = listen_sock.accept()
-                        peer_label = f"{address[0]}:{address[1]}"
-                        break
-                    except socket.timeout:
-                        continue
+            for attempt in range(1, total_attempts + 1):
+                if self._stop.is_set():
+                    return
+                self._ready.clear()
+                self._log(
+                    "Connect",
+                    f"Connection attempt {attempt}/{total_attempts}",
+                )
+                try:
+                    self._connect_once(role, host, port)
+                except Exception as exc:
+                    failure = exc
                 else:
                     return
-            else:
-                self.status_changed.emit(f"{ui_text('Connecting to')} {host}:{port}")
-                sock = socket.create_connection((host, port), timeout=10)
-                sock.settimeout(None)
-                peer_label = f"{host}:{port}"
+                finally:
+                    self._ready.clear()
+                    self._close_incoming(ui_text("Connection interrupted, file is incomplete"))
+                    self._shutdown_sockets()
 
-            self.status_changed.emit(ui_text("Establishing encrypted session"))
-            key = perform_handshake(sock, is_server=(role == "server"))
-            with self._state_lock:
-                self._sock = sock
-                self._key = key
-            self._ready.set()
-            self.connected.emit(peer_label)
-
-            threading.Thread(target=self._text_send_worker, daemon=True, name="text-sender").start()
-            threading.Thread(target=self._file_send_worker, daemon=True, name="file-sender").start()
-            self._receive_worker()
-        except (OSError, EOFError, ValueError) as exc:
-            if not self._stop.is_set():
-                self._emit_disconnected(f"{ui_text('Connection failed')}:{exc}")
+                if self._stop.is_set():
+                    return
+                self._log(
+                    "ConnectFailed",
+                    f"Attempt {attempt}/{total_attempts} failed, "
+                    f"{type(failure).__name__}: {failure}",
+                )
+                if attempt >= total_attempts:
+                    self._emit_disconnected(
+                        f"{ui_text('Connection failed')}: tried {total_attempts} times"
+                    )
+                    return
+                self._log(
+                    "Reconnect",
+                    f"Attempt {attempt + 1}/{total_attempts} in "
+                    f"{RECONNECT_DELAY_SECONDS:g} seconds",
+                )
+                if self._stop.wait(RECONNECT_DELAY_SECONDS):
+                    return
         finally:
             self._stop.set()
             self._ready.clear()
-            self._close_incoming(ui_text("Connection interrupted; file is incomplete"))
+            self._close_incoming(ui_text("Connection interrupted, file is incomplete"))
             self._shutdown_sockets()
+            self._log("Connect", "Connection worker thread has ended")
+
+    def _connect_once(self, role: str, host: str, port: int) -> None:
+        if role == "server":
+            self.status_changed.emit(f"{ui_text('Listening on')} 0.0.0.0:{port}")
+            self._log("Listen", f"Binding to 0.0.0.0:{port}")
+            listen_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self._listen_sock = listen_sock
+            listen_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listen_sock.bind(("0.0.0.0", port))
+            listen_sock.listen(1)
+            listen_sock.settimeout(0.5)
+            self._log("Listen", f"TCP listener ready, waiting for a client on 0.0.0.0:{port}")
+            while not self._stop.is_set():
+                try:
+                    sock, address = listen_sock.accept()
+                    peer_label = f"{address[0]}:{address[1]}"
+                    self._log(
+                        "TCP",
+                        f"Client connected, peer {peer_label}, local {sock.getsockname()}",
+                    )
+                    # Store the raw socket before the handshake so a failed
+                    # attempt is closed by the retry cleanup path.
+                    with self._state_lock:
+                        self._sock = sock
+                    sock.settimeout(HANDSHAKE_TIMEOUT_SECONDS)
+                    break
+                except socket.timeout:
+                    continue
+            else:
+                return
+        else:
+            self.status_changed.emit(f"{ui_text('Connecting to')} {host}:{port}")
+            self._log("TCP", f"Connecting to server {host}:{port} (10 second connect timeout)")
+            sock = socket.create_connection((host, port), timeout=10)
+            # Store the raw socket before the handshake so a failed attempt is
+            # closed by the retry cleanup path.
+            with self._state_lock:
+                self._sock = sock
+            sock.settimeout(HANDSHAKE_TIMEOUT_SECONDS)
+            peer_label = f"{host}:{port}"
+            self._log(
+                "TCP",
+                f"Connected, local {sock.getsockname()}, server {sock.getpeername()}",
+            )
+
+        self.status_changed.emit(ui_text("Establishing the encrypted session"))
+        self._log(
+            "Handshake",
+            f"Starting the encrypted session with {peer_label} "
+            f"({HANDSHAKE_TIMEOUT_SECONDS} second timeout)",
+        )
+        key = perform_handshake(sock, is_server=(role == "server"))
+        sock.settimeout(None)
+        with self._state_lock:
+            self._sock = sock
+            self._key = key
+        self._ready.set()
+        self.connected.emit(peer_label)
+        self._log("Connect", f"TCP connection and encrypted handshake complete, peer {peer_label}")
+
+        threading.Thread(target=self._text_send_worker, daemon=True, name="text-sender").start()
+        threading.Thread(target=self._file_send_worker, daemon=True, name="file-sender").start()
+        self._receive_worker()
 
     def _text_send_worker(self) -> None:
         while not self._stop.is_set():
@@ -265,7 +392,7 @@ class TransferEngine(QObject):
                 self._send(MSG_TEXT, text.encode("utf-8"))
             except (OSError, EOFError, ValueError) as exc:
                 self.message_failed.emit(str(exc))
-                self._connection_lost(f"{ui_text('Message send failed')}:{exc}")
+                self._connection_lost(f"{ui_text('Failed to send the message')}: {exc}")
                 return
 
     def _file_send_worker(self) -> None:
@@ -284,20 +411,20 @@ class TransferEngine(QObject):
                     "id": ui_id,
                     "direction": "out",
                     "state": "failed",
-                    "detail": f"{ui_text('Send failed')}:{exc}",
+                    "detail": f"{ui_text('Send failed')}: {exc}",
                 })
 
     def _send_file(self, ui_id: str, path: pathlib.Path) -> None:
         if not path.is_file():
-            raise ValueError(ui_text("File does not exist or is not a regular file"))
+            raise ValueError(ui_text("The file does not exist or is not a regular file"))
         file_size = path.stat().st_size
         file_name_bytes = path.name.encode("utf-8")
         if len(file_name_bytes) > 0xFFFF:
-            raise ValueError(ui_text("File name is too long"))
+            raise ValueError(ui_text("The file name is too long"))
 
         self.file_changed.emit({
             "id": ui_id, "direction": "out", "state": "hashing",
-            "name": path.name, "size": file_size, "detail": ui_text("Calculating SHA-256"),
+            "name": path.name, "size": file_size, "detail": ui_text("Computing SHA-256"),
         })
         digest_state = hashlib.sha256()
         hashed = 0
@@ -305,7 +432,7 @@ class TransferEngine(QObject):
         with path.open("rb") as handle:
             for chunk in iter(lambda: handle.read(FILE_CHUNK_SIZE), b""):
                 if self._stop.is_set():
-                    raise EOFError(ui_text("Connection closed"))
+                    raise EOFError(ui_text("The connection was closed"))
                 digest_state.update(chunk)
                 hashed += len(chunk)
                 now = time.monotonic()
@@ -338,7 +465,7 @@ class TransferEngine(QObject):
             with path.open("rb") as handle:
                 for chunk in iter(lambda: handle.read(FILE_CHUNK_SIZE), b""):
                     if self._stop.is_set():
-                        raise EOFError(ui_text("Connection closed"))
+                        raise EOFError(ui_text("The connection was closed"))
                     self._send(MSG_FILE_CHUNK, transfer_id + chunk)
                     time.sleep(0)
                     sent += len(chunk)
@@ -354,7 +481,7 @@ class TransferEngine(QObject):
             self.file_changed.emit({
                 "id": ui_id, "direction": "out", "state": "verifying",
                 "progress": 100, "hash": digest.hex(),
-                "detail": ui_text("Waiting for peer SHA-256 verification"),
+                "detail": ui_text("Waiting for the peer SHA-256 verification"),
             })
         except Exception:
             with self._pending_lock:
@@ -368,17 +495,17 @@ class TransferEngine(QObject):
                 frame = recv_frame(sock)
                 key = self._key
                 if key is None:
-                    raise EOFError(ui_text("Encrypted session is not established"))
+                    raise EOFError(ui_text("The encrypted session was not established"))
                 plaintext = decrypt(key, frame)
                 self._dispatch(plaintext)
             except (OSError, EOFError, ValueError, IndexError) as exc:
                 if not self._stop.is_set():
-                    self._connection_lost(f"{ui_text('Connection disconnected')}:{exc}")
+                    self._connection_lost(f"{ui_text('The connection was dropped')}: {exc}")
                 return
 
     def _dispatch(self, plaintext: bytes) -> None:
         if not plaintext:
-            raise ValueError(ui_text("Received an empty frame"))
+            raise ValueError(ui_text("Received an empty data frame"))
         msg_type, body = plaintext[0], plaintext[1:]
         if msg_type == MSG_TEXT:
             self.message_received.emit(body.decode("utf-8", errors="replace"))
@@ -389,21 +516,21 @@ class TransferEngine(QObject):
         elif msg_type == MSG_FILE_RESULT:
             self._receive_result(body)
         elif msg_type == MSG_CLOSE:
-            self._connection_lost(ui_text("Peer closed the connection"))
+            self._connection_lost(ui_text("The peer ended the connection"))
         else:
             raise ValueError(f"{ui_text('Unknown message type')} {msg_type}")
 
     def _begin_receive(self, payload: bytes) -> None:
         if len(payload) < TRANSFER_ID_SIZE + 42:
-            raise ValueError(ui_text("Incomplete file metadata"))
+            raise ValueError(ui_text("The file metadata is incomplete"))
         if self._incoming is not None:
-            raise ValueError(ui_text("Previous file is not complete"))
+            raise ValueError(ui_text("The previous file has not finished receiving"))
         transfer_id = payload[:16]
         name_len = struct.unpack(">H", payload[16:18])[0]
         total_size = struct.unpack(">Q", payload[18:26])[0]
         expected_digest = payload[26:58]
         if len(payload) != 58 + name_len:
-            raise ValueError(ui_text("Invalid file metadata length"))
+            raise ValueError(ui_text("The file metadata length is wrong"))
         file_name = payload[58:].decode("utf-8")
         self._download_dir.mkdir(parents=True, exist_ok=True)
         target = unique_target(self._download_dir, file_name)
@@ -417,20 +544,20 @@ class TransferEngine(QObject):
         self.file_changed.emit({
             "id": ui_id, "direction": "in", "state": "receiving",
             "name": target.name, "size": total_size, "progress": 0,
-            "detail": f"{ui_text('Receiving to')} {target}", "hash": expected_digest.hex(),
+            "detail": f"{ui_text('Receiving into')} {target}", "hash": expected_digest.hex(),
         })
         if total_size == 0:
             self._finish_receive()
 
     def _receive_chunk(self, payload: bytes) -> None:
         if self._incoming is None or len(payload) < TRANSFER_ID_SIZE:
-            raise ValueError(ui_text("Unexpected file data"))
+            raise ValueError(ui_text("Received unexpected file data"))
         chunk_id, chunk = payload[:16], payload[16:]
         transfer_id, ui_id, target, total, received, handle, digest, expected = self._incoming
         if chunk_id != transfer_id:
-            raise ValueError(ui_text("File transfer ID mismatch"))
+            raise ValueError(ui_text("The file transfer ID does not match"))
         if len(chunk) > total - received:
-            raise ValueError(ui_text("File data exceeds declared size"))
+            raise ValueError(ui_text("The file data exceeds the declared size"))
         handle.write(chunk)
         digest.update(chunk)
         received += len(chunk)
@@ -464,25 +591,25 @@ class TransferEngine(QObject):
             "hash": actual.hex(),
             "path": str(target) if verified else "",
             "detail": (
-                f"{ui_text('SHA-256 verification succeeded')} - {ui_text('Saved to')} {target}"
+                f"{ui_text('SHA-256 verification succeeded')} · {ui_text('Saved to')} {target}"
                 if verified else
-                f"{ui_text('SHA-256 verification failed')} - {ui_text('expected')} {expected.hex()} - "
-                f"{ui_text('actual')} {actual.hex()}"
+                f"{ui_text('SHA-256 verification failed')} · {ui_text('Expected')} {expected.hex()} · "
+                f"{ui_text('Actual')} {actual.hex()}"
             ),
         })
 
     def _receive_result(self, payload: bytes) -> None:
         if len(payload) != TRANSFER_ID_SIZE + 1 + 32:
-            raise ValueError(ui_text("Invalid file verification response"))
+            raise ValueError(ui_text("The file verification receipt is invalid"))
         transfer_id = payload[:16]
         flag = payload[16]
         actual = payload[17:]
         if flag not in (0, 1):
-            raise ValueError(ui_text("Invalid file verification status"))
+            raise ValueError(ui_text("The file verification status is invalid"))
         with self._pending_lock:
             pending = self._pending.pop(transfer_id, None)
         if pending is None:
-            raise ValueError(ui_text("Verification response for unknown file"))
+            raise ValueError(ui_text("Received a verification receipt for an unknown file"))
         expected = pending["digest"]
         verified = flag == 1 and actual == expected
         self.file_changed.emit({
@@ -490,10 +617,10 @@ class TransferEngine(QObject):
             "state": "complete" if verified else "failed",
             "progress": 100, "hash": actual.hex(),
             "detail": (
-                ui_text("Peer SHA-256 verification succeeded")
+                ui_text("The peer verified SHA-256 successfully, transfer complete")
                 if verified else
-                f"{ui_text('Peer verification failed')} - {ui_text('expected')} {expected.hex()} - "
-                f"{ui_text('peer')} {actual.hex()}"
+                f"{ui_text('The peer verification failed')} · {ui_text('Expected')} {expected.hex()} · "
+                f"{ui_text('Peer')} {actual.hex()}"
             ),
         })
 
@@ -502,7 +629,7 @@ class TransferEngine(QObject):
             raise EOFError(ui_text("Not connected"))
         key = self._key
         if key is None:
-            raise EOFError(ui_text("Encrypted session is not established"))
+            raise EOFError(ui_text("The encrypted session was not established"))
         packet = encrypt(key, bytes([msg_type]) + payload)
         with self._send_lock:
             send_frame(self._get_socket(), packet)
@@ -510,10 +637,11 @@ class TransferEngine(QObject):
     def _get_socket(self) -> socket.socket:
         with self._state_lock:
             if self._sock is None:
-                raise EOFError(ui_text("Connection unavailable"))
+                raise EOFError(ui_text("The connection is unavailable"))
             return self._sock
 
     def _connection_lost(self, reason: str) -> None:
+        self._log("Disconnected", reason)
         self._stop.set()
         self._ready.clear()
         self._fail_outgoing(reason)
@@ -601,10 +729,10 @@ class StartDialog(QDialog):
         mark = QLabel(ui_text("O"))
         mark.setObjectName("brandMark")
         mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title = QLabel(ui_text("Choose operating mode"))
+        title = QLabel(ui_text("Choose how to run"))
         title.setObjectName("dialogTitle")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        subtitle = QLabel(ui_text("Encrypted chat and verified file transfer"))
+        subtitle = QLabel(ui_text("End-to-end encrypted chat and file transfer"))
         subtitle.setObjectName("muted")
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         root.addWidget(mark, 0, Qt.AlignmentFlag.AlignCenter)
@@ -612,20 +740,22 @@ class StartDialog(QDialog):
         root.addWidget(subtitle)
 
         choices = QHBoxLayout()
-        self.server_button = QPushButton(ui_text("Run as server"))
-        self.client_button = QPushButton(ui_text("Run as client"))
+        self.server_button = QPushButton(ui_text("Act as server"))
+        self.client_button = QPushButton(ui_text("Act as client"))
         for button in (self.server_button, self.client_button):
             button.setCheckable(True)
             button.setMinimumHeight(42)
         self.server_button.setChecked(True)
-        self.server_button.clicked.connect(lambda: self._set_role("server"))
-        self.client_button.clicked.connect(lambda: self._set_role("client"))
+        # Cython/PyQt: clicked(bool) always sends the checked state. Connect
+        # explicit bool slots instead of relying on PyQt to drop extra args.
+        self.server_button.clicked.connect(self._select_server_role)
+        self.client_button.clicked.connect(self._select_client_role)
         choices.addWidget(self.server_button)
         choices.addWidget(self.client_button)
         root.addLayout(choices)
 
         self.host_input = QLineEdit("127.0.0.1")
-        self.host_input.setPlaceholderText(ui_text("Server IP or hostname"))
+        self.host_input.setPlaceholderText(ui_text("Server IP or domain name"))
         self.host_input.setEnabled(False)
         self.port_input = QSpinBox()
         self.port_input.setRange(1, 65535)
@@ -643,6 +773,13 @@ class StartDialog(QDialog):
         self.start_button.clicked.connect(self._accept_checked)
         root.addWidget(self.start_button)
 
+    # Cython/PyQt: these slots explicitly match QPushButton.clicked(bool).
+    def _select_server_role(self, _checked: bool) -> None:
+        self._set_role("server")
+
+    def _select_client_role(self, _checked: bool) -> None:
+        self._set_role("client")
+
     def _set_role(self, role: str) -> None:
         self.role = role
         is_client = role == "client"
@@ -650,10 +787,11 @@ class StartDialog(QDialog):
         self.client_button.setChecked(is_client)
         self.host_input.setEnabled(is_client)
         self.start_button.setText(
-            ui_text("Connect") if is_client else ui_text("Start listening")
+            ui_text("Connect to server") if is_client else ui_text("Start listening")
         )
 
-    def _accept_checked(self) -> None:
+    # Cython/PyQt: match clicked(bool); do not omit the signal argument.
+    def _accept_checked(self, _checked: bool) -> None:
         if self.role == "client" and not self.host_input.text().strip():
             self.host_input.setFocus()
             return
@@ -810,8 +948,8 @@ class FileBubble(ClickableBubble):
 
     def contextMenuEvent(self, event) -> None:
         menu = QMenu(self)
-        open_location_action = menu.addAction("Open File Location")
-        save_action = menu.addAction("Save As")
+        open_location_action = menu.addAction("Open the file location")
+        save_action = menu.addAction("Save as")
         can_access_file = bool(self.received_path)
         open_location_action.setEnabled(can_access_file)
         save_action.setEnabled(can_access_file)
@@ -850,15 +988,18 @@ class DropChatArea(QScrollArea):
 
     def contextMenuEvent(self, event) -> None:
         menu = QMenu(self)
-        export_action = menu.addAction("Export Chat History")
+        export_action = menu.addAction("Export chat history")
         if menu.exec(event.globalPos()) == export_action:
             self.export_requested.emit()
 
 
 #---------- Main chat window ----------
 class MainWindow(QMainWindow):
+    return_to_start_requested = pyqtSignal()
+
     def __init__(self, role: str, host: str, port: int) -> None:
         super().__init__()
+        self.role = role
         self.setWindowTitle(ui_text(APP_NAME))
         self.resize(980, 720)
         self.setMinimumSize(700, 540)
@@ -887,8 +1028,8 @@ class MainWindow(QMainWindow):
         chat_content = QWidget()
         chat_content.setObjectName("chatContent")
         self.messages = QVBoxLayout(chat_content)
-        self.messages.setContentsMargins(28, 24, 28, 24)
-        self.messages.setSpacing(12)
+        self.messages.setContentsMargins(7, 24, 28, 24)  # (left, top, right, bottom) pixels
+        self.messages.setSpacing(7)
         self.messages.addStretch()
         self.chat.setWidget(chat_content)
         root.addWidget(self.chat, 1)
@@ -902,16 +1043,19 @@ class MainWindow(QMainWindow):
         self.attach_button.setText("+")
         self.attach_button.setToolTip(ui_text("Select multiple files"))
         self.attach_button.setFixedSize(34, 34)
+        # Cython/PyQt: QToolButton.clicked also emits bool.
         self.attach_button.clicked.connect(self._choose_files)
         self.composer = Composer()
         self.composer.setPlaceholderText(
-            ui_text("Message; Shift+Enter for newline, Ctrl+Enter to send")
+            ui_text("Type a message; Shift+Enter for a new line, Ctrl+Enter to send")
         )
+        # The composer signal has no payload, while QPushButton.clicked has a
+        # bool payload. Keep separate slots so both signatures stay explicit.
         self.composer.send_requested.connect(self._send_message)
         self.send_button = QPushButton(ui_text("Send"))
         self.send_button.setObjectName("sendButton")
         self.send_button.setFixedSize(62, 34)
-        self.send_button.clicked.connect(self._send_message)
+        self.send_button.clicked.connect(self._send_button_clicked)
         composer_layout.addWidget(self.attach_button, 0, Qt.AlignmentFlag.AlignBottom)
         composer_layout.addWidget(self.composer, 1)
         composer_layout.addWidget(self.send_button, 0, Qt.AlignmentFlag.AlignBottom)
@@ -929,16 +1073,31 @@ class MainWindow(QMainWindow):
     def _on_connected(self, peer: str) -> None:
         self.is_connected = True
         self._set_controls_enabled(True)
+        # Client mode: only show the chat window after TCP and crypto handshake
+        # have both succeeded and TransferEngine emits connected.
+        if self.role == "client" and not self.isVisible():
+            self.show()
+            self.raise_()
+            self.activateWindow()
         self.composer.setFocus()
 
     def _on_disconnected(self, reason: str) -> None:
         self.is_connected = False
         self._set_controls_enabled(False)
+        # After all connection retries, or if an active session drops, return
+        # to role selection instead of leaving a disabled window or quitting.
+        self.hide()
+        self.return_to_start_requested.emit()
 
     def _set_controls_enabled(self, enabled: bool) -> None:
         self.composer.setEnabled(enabled)
         self.send_button.setEnabled(enabled)
         self.attach_button.setEnabled(enabled)
+
+    # Cython/PyQt: clicked(bool) is handled here, then forwarded to the
+    # no-argument action used by Composer.send_requested.
+    def _send_button_clicked(self, _checked: bool) -> None:
+        self._send_message()
 
     def _send_message(self) -> None:
         text = self.composer.toPlainText()
@@ -948,7 +1107,8 @@ class MainWindow(QMainWindow):
         self._add_text(text, True)
         self.engine.send_text(text)
 
-    def _choose_files(self) -> None:
+    # Cython/PyQt: match QToolButton.clicked(bool) exactly.
+    def _choose_files(self, _checked: bool) -> None:
         paths, _ = QFileDialog.getOpenFileNames(self, ui_text("Select files to send"))
         self._queue_files(paths)
 
@@ -968,7 +1128,7 @@ class MainWindow(QMainWindow):
         bubble = self.file_bubbles.get(ui_id)
         if bubble is None:
             bubble = FileBubble(
-                str(event.get("name", ui_text("Incoming file"))),
+                str(event.get("name", ui_text("Received file"))),
                 event.get("direction") == "out",
                 int(event["size"]) if "size" in event else None,
             )
@@ -1005,7 +1165,7 @@ class MainWindow(QMainWindow):
 
     def _save_file_as(self, source_path: str) -> None:
         source = pathlib.Path(source_path)
-        destination, _ = QFileDialog.getSaveFileName(self, "Save As", source.name)
+        destination, _ = QFileDialog.getSaveFileName(self, "Save as", source.name)
         if not destination:
             return
         threading.Thread(
@@ -1038,6 +1198,7 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:
         self.engine.stop()
         event.accept()
+        QApplication.quit()
 
 
 #---------- Zero-blue-channel theme ----------
@@ -1126,6 +1287,9 @@ QToolTip { color: #ffff00; background: #4a3100; border: none; padding: 5px; }
 #---------- Program entry ----------
 def main() -> int:
     app = QApplication(sys.argv)
+    # Keep the event loop alive while a client connects with its chat window
+    # intentionally hidden; MainWindow.closeEvent handles normal app exit.
+    app.setQuitOnLastWindowClosed(False)
     app.setApplicationName(ui_text(APP_NAME))
     app.setStyle("Fusion")
     palette = app.palette()
@@ -1147,12 +1311,31 @@ def main() -> int:
     app.setPalette(palette)
     app.setStyleSheet(STYLE)
 
-    dialog = StartDialog()
-    if dialog.exec() != QDialog.DialogCode.Accepted:
-        return 0
-    window = MainWindow(*dialog.values())
-    window.show()
-    return app.exec()
+    while True:
+        dialog = StartDialog()
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return 0
+        role, host, port = dialog.values()
+        window = MainWindow(role, host, port)
+        restart_from_connection_failure = False
+
+        def return_to_start() -> None:
+            nonlocal restart_from_connection_failure
+            restart_from_connection_failure = True
+            app.quit()
+
+        window.return_to_start_requested.connect(return_to_start)
+        # Servers show their window immediately to indicate that they are
+        # waiting. Client chat windows are shown only after the handshake.
+        if role == "server":
+            window.show()
+        exit_code = app.exec()
+        window.hide()
+        window.engine.stop()
+        window.deleteLater()
+        if restart_from_connection_failure:
+            continue
+        return exit_code
 
 
 if __name__ == "__main__":
