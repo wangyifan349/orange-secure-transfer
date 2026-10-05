@@ -183,5 +183,5 @@ LICENSE                     GNU AGPL-3.0 许可证
 如果这个项目对你有帮助，可以使用 Bitcoin 支持：
 
 ```text
-bc1qevgpfgmy3al2v8anu7n4zrgem8045dkvu3ulrh7rjyd4jv3dsgwswkq6tj
+bc1qwhzzk5tx07592vkf97rt8x8v0zdntad8lexnrgv3gdmecg8pfmhqzceedl
 ```

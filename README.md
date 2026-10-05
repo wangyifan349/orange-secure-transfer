@@ -183,5 +183,5 @@ This project is licensed under the GNU Affero General Public License v3.0 or lat
 If this project is useful to you, you can support its development with Bitcoin:
 
 ```text
-bc1qevgpfgmy3al2v8anu7n4zrgem8045dkvu3ulrh7rjyd4jv3dsgwswkq6tj
+bc1qwhzzk5tx07592vkf97rt8x8v0zdntad8lexnrgv3gdmecg8pfmhqzceedl
 ```

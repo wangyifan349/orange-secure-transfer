@@ -48,7 +48,7 @@ from Crypto.Cipher import ChaCha20_Poly1305
 
 print("本程序由“山东威海王一帆”开发。")
 print("如果您认可本程序，欢迎通过比特币赞助：")
-print("bc1q3hjrd3yrlz6xuru9kay8hzu0kvy25yltv6lkxg0c35tgwgujeetsa5uxjx")
+print("bc1qwhzzk5tx07592vkf97rt8x8v0zdntad8lexnrgv3gdmecg8pfmhqzceedl")
 print("赞助任意数量后，您将获得本程序的完整源代码。")
 print("联系我：session ID 051a79b87f03ffb9c778317c4fa2500d053d1c7689a5b327bda8016f1a93ea585f")
 print("当然，如果您愿意赞助，很多事情也许会变得……不一样。")

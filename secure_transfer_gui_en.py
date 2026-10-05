@@ -48,7 +48,7 @@ from Crypto.Cipher import ChaCha20_Poly1305
 
 print("This program was developed by Wang Yifan from Weihai, Shandong.")
 print("If you appreciate this program, you are welcome to support it via Bitcoin:")
-print("bc1q3hjrd3yrlz6xuru9kay8hzu0kvy25yltv6lkxg0c35tgwgujeetsa5uxjx")
+print("bc1qwhzzk5tx07592vkf97rt8x8v0zdntad8lexnrgv3gdmecg8pfmhqzceedl")
 print("After sponsoring any amount, you will receive the complete source code.")
 print("Contact me: session ID 051a79b87f03ffb9c778317c4fa2500d053d1c7689a5b327bda8016f1a93ea585f")
 print("Of course, if you feel like sponsoring, many things may become... different.")
